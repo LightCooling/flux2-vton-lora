@@ -24,7 +24,7 @@ class SimpleFluxDataset(Dataset):
         transform = transforms.Compose(
             [
                 transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(resolution),
+                transforms.CenterCrop((resolution, resolution // 4 * 3)),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
@@ -118,6 +118,12 @@ def parse_args(input_args=None):
         default=512,
         help="Resolution",
     )
+    parser.add_argument(
+        "--max_sequence_length",
+        type=int,
+        default=512,
+        help="Maximum sequence length to use with with the T5 text encoder",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -181,9 +187,12 @@ def main(args):
 
     # Prompts encode
     for item in tqdm(train_dataset.data):
-        prompt_embeds, text_ids = text_encoding_pipeline.encode_prompt(item["prompts"])
-        prompt_embeds_all.append(prompt_embeds)
-        text_ids_all.append(text_ids)
+        prompt_embeds, text_ids = text_encoding_pipeline.encode_prompt(
+            item["prompts"],
+            max_sequence_length=args.max_sequence_length
+        )
+        prompt_embeds_all.append(prompt_embeds.squeeze(0))
+        text_ids_all.append(text_ids.squeeze(0))
 
     # Save text caches
     torch.save(prompt_embeds_all, os.path.join(args.output_dir, "prompt_embeds.pt"))
@@ -222,7 +231,7 @@ def main(args):
             latents = vae.encode(image).latent_dist.mode()
             latents = Flux2Pipeline._patchify_latents(latents)
             latents = (latents - latents_bn_mean.to(device)) / latents_bn_std.to(device)
-            latents_list.append(latents.cpu())
+            latents_list.append(latents.squeeze(0).cpu())
 
     # Save caches
     torch.save(latents_all, os.path.join(args.output_dir, "latents.pt"))
