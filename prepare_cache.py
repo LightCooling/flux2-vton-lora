@@ -19,9 +19,9 @@ from transformers import Mistral3ForConditionalGeneration, PixtralProcessor
 
 class SimpleFluxDataset(Dataset):
     def __init__(self, dataset_name, image_column, cond1_column, cond2_column, caption_column, resolution):
-        dataset = load_dataset(dataset_name)["train"]
-        self.data = []
-        transform = transforms.Compose(
+        self.dataset = load_dataset(dataset_name)["train"]
+        self.length = len(self.dataset)
+        self.transform = transforms.Compose(
             [
                 transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.CenterCrop((resolution, resolution // 4 * 3)),
@@ -29,41 +29,46 @@ class SimpleFluxDataset(Dataset):
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
-        for item in dataset:
-            image = item[image_column]
-            image = exif_transpose(image)
-            if image.mode != "RGB":
-                image = image.convert("RGB")
-            pixel_values = transform(image)
-
-            cond1 = item[cond1_column]
-            cond1 = exif_transpose(cond1)
-            if cond1.mode != "RGB":
-                cond1 = cond1.convert("RGB")
-            cond1_values = transform(cond1)
-
-            cond2 = item[cond2_column]
-            cond2 = exif_transpose(cond2)
-            if cond2.mode != "RGB":
-                cond2 = cond2.convert("RGB")
-            cond2_values = transform(cond2)
-
-            caption = item[caption_column]
-
-            self.data.append(
-                {
-                    "pixel_values": pixel_values,
-                    "cond1_values": cond1_values,
-                    "cond2_values": cond2_values,
-                    "prompts": caption,
-                }
-            )
+        self.image_column = image_column
+        self.cond1_column = cond1_column
+        self.cond2_column = cond2_column
+        self.caption_column = caption_column
 
     def __len__(self):
-        return len(self.data)
+        return self.length
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        item = self.dataset[idx]
+
+        # Process target image
+        image = item[self.image_column]
+        image = exif_transpose(image)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        pixel_values = self.transform(image)
+
+        # Process condition1 image
+        cond1 = item[self.cond1_column]
+        cond1 = exif_transpose(cond1)
+        if cond1.mode != "RGB":
+            cond1 = cond1.convert("RGB")
+        cond1_values = self.transform(cond1)
+
+        # Process condition2 image
+        cond2 = item[self.cond2_column]
+        cond2 = exif_transpose(cond2)
+        if cond2.mode != "RGB":
+            cond2 = cond2.convert("RGB")
+        cond2_values = self.transform(cond2)
+
+        caption = item[self.caption_column]
+
+        return {
+            "pixel_values": pixel_values,
+            "cond1_values": cond1_values,
+            "cond2_values": cond2_values,
+            "prompts": caption,
+        }
 
 
 def parse_args(input_args=None):
@@ -182,21 +187,16 @@ def main(args):
     text_encoding_pipeline.to(device)
 
     print("Processing text embeddings...")
-    prompt_embeds_all = []
-    text_ids_all = []
 
     # Prompts encode
-    for item in tqdm(train_dataset.data):
+    for i in tqdm(range(len(train_dataset))):
+        item = train_dataset[i]
         prompt_embeds, text_ids = text_encoding_pipeline.encode_prompt(
             item["prompts"],
             max_sequence_length=args.max_sequence_length
         )
-        prompt_embeds_all.append(prompt_embeds.squeeze(0))
-        text_ids_all.append(text_ids.squeeze(0))
-
-    # Save text caches
-    torch.save(prompt_embeds_all, os.path.join(args.output_dir, "prompt_embeds.pt"))
-    torch.save(text_ids_all, os.path.join(args.output_dir, "text_ids.pt"))
+        torch.save(prompt_embeds.squeeze(0), os.path.join(args.output_dir, f"prompt_embeds_{i:06d}.pt"))
+        torch.save(text_ids.squeeze(0), os.path.join(args.output_dir, f"text_ids_{i:06d}.pt"))
 
     # Free memory
     del text_encoder, tokenizer, text_encoding_pipeline
@@ -216,27 +216,20 @@ def main(args):
     vae.to(device)
 
     print("Processing image latents...")
-    latents_all = []
-    cond1_latents_all = []
-    cond2_latents_all = []
 
     # VAE encode
-    for item in tqdm(train_dataset.data):
-        for column_name, latents_list in [
-            ("pixel_values", latents_all),
-            ("cond1_values", cond1_latents_all),
-            ("cond2_values", cond2_latents_all)
+    for i in tqdm(range(len(train_dataset))):
+        item = train_dataset[i]
+        for column_name, file_prefix in [
+            ("pixel_values", "latents"),
+            ("cond1_values", "cond1_latents"),
+            ("cond2_values", "cond2_latents")
         ]:
             image = item[column_name].unsqueeze(0).to(device, dtype=vae.dtype)
             latents = vae.encode(image).latent_dist.mode()
             latents = Flux2Pipeline._patchify_latents(latents)
             latents = (latents - latents_bn_mean.to(device)) / latents_bn_std.to(device)
-            latents_list.append(latents.squeeze(0).cpu())
-
-    # Save caches
-    torch.save(latents_all, os.path.join(args.output_dir, "latents.pt"))
-    torch.save(cond1_latents_all, os.path.join(args.output_dir, "cond1_latents.pt"))
-    torch.save(cond2_latents_all, os.path.join(args.output_dir, "cond2_latents.pt"))
+            torch.save(latents.squeeze(0).cpu(), os.path.join(args.output_dir, f"{file_prefix}_{i:06d}.pt"))
 
     print(f"Caches saved to {args.output_dir}")
 

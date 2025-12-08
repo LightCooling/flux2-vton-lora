@@ -46,24 +46,21 @@ class SimpleFluxDataset(Dataset):
     """Simple dataset that loads pre-computed caches"""
 
     def __init__(self, cache_dir):
-        self.prompt_embeds = torch.load(os.path.join(cache_dir, "prompt_embeds.pt"))
-        self.text_ids = torch.load(os.path.join(cache_dir, "text_ids.pt"))
-        self.latents = torch.load(os.path.join(cache_dir, "latents.pt"))
-        self.cond1_latents = torch.load(os.path.join(cache_dir, "cond1_latents.pt"))
-        self.cond2_latents = torch.load(os.path.join(cache_dir, "cond2_latents.pt"))
-
-        assert len(self.prompt_embeds) == len(self.text_ids) == len(self.latents) == len(self.cond1_latents) == len(self.cond2_latents)
+        self.cache_dir = cache_dir
+        # Determine length by counting prompt_embeds files
+        prompt_embeds_files = [f for f in os.listdir(cache_dir) if f.startswith("prompt_embeds_") and f.endswith(".pt")]
+        self.length = len(prompt_embeds_files)
 
     def __len__(self):
-        return len(self.latents)
+        return self.length
 
     def __getitem__(self, idx):
         return {
-            "prompt_embeds": self.prompt_embeds[idx],
-            "text_ids": self.text_ids[idx],
-            "latents": self.latents[idx],
-            "cond1_latents": self.cond1_latents[idx],
-            "cond2_latents": self.cond2_latents[idx],
+            "prompt_embeds": torch.load(os.path.join(self.cache_dir, f"prompt_embeds_{idx:06d}.pt")),
+            "text_ids": torch.load(os.path.join(self.cache_dir, f"text_ids_{idx:06d}.pt")),
+            "latents": torch.load(os.path.join(self.cache_dir, f"latents_{idx:06d}.pt")),
+            "cond1_latents": torch.load(os.path.join(self.cache_dir, f"cond1_latents_{idx:06d}.pt")),
+            "cond2_latents": torch.load(os.path.join(self.cache_dir, f"cond2_latents_{idx:06d}.pt")),
         }
 
 
