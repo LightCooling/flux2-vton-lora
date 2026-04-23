@@ -7,8 +7,7 @@ from transformers import Mistral3ForConditionalGeneration
 
 from diffusers import Flux2Pipeline, Flux2Transformer2DModel, AutoencoderKLFlux2
 from diffusers.utils import load_image
-from peft import cast_mixed_precision_params, PeftModel
-from transformers import BitsAndBytesConfig
+
 
 def print_gpu_memory_usage():
     allocated = torch.cuda.memory_allocated() / 1024**3
@@ -133,4 +132,3 @@ del pipe
 gc.collect()
 torch.cuda.empty_cache()
 print_gpu_memory_usage()
-

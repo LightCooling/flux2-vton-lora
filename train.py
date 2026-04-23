@@ -17,6 +17,7 @@
 # Simplified Flux.2 LoRA training script using pre-computed caches
 
 import argparse
+import math
 import os
 import random
 import shutil
@@ -45,22 +46,101 @@ check_min_version("0.36.0.dev0")
 class SimpleFluxDataset(Dataset):
     """Simple dataset that loads pre-computed caches"""
 
+    CACHE_PREFIXES = ("prompt_embeds", "text_ids", "latents", "cond1_latents", "cond2_latents")
+    LATENT_PREFIXES = ("latents", "cond1_latents", "cond2_latents")
+
     def __init__(self, cache_dir):
         self.cache_dir = cache_dir
-        # Determine length by counting prompt_embeds files
-        prompt_embeds_files = [f for f in os.listdir(cache_dir) if f.startswith("prompt_embeds_") and f.endswith(".pt")]
-        self.length = len(prompt_embeds_files)
+        self.length = self._validate_cache()
+
+    def _collect_indices(self, prefix):
+        if not os.path.isdir(self.cache_dir):
+            raise ValueError(f"Cache directory does not exist: {self.cache_dir}")
+
+        indices = []
+        prefix_with_sep = f"{prefix}_"
+        for filename in os.listdir(self.cache_dir):
+            if not filename.startswith(prefix_with_sep) or not filename.endswith(".pt"):
+                continue
+            index_part = filename[len(prefix_with_sep):-3]
+            if not index_part.isdigit():
+                raise ValueError(f"Unexpected cache filename for prefix '{prefix}': {filename}")
+            indices.append(int(index_part))
+
+        if not indices:
+            raise ValueError(f"No cache files found for prefix '{prefix}' in {self.cache_dir}")
+
+        indices = sorted(indices)
+        expected = list(range(len(indices)))
+        if indices != expected:
+            missing = sorted(set(expected) - set(indices))[:10]
+            raise ValueError(
+                f"Cache files for prefix '{prefix}' must be contiguous from 0. "
+                f"Found min={indices[0]}, max={indices[-1]}, count={len(indices)}, missing sample={missing}"
+            )
+
+        return indices
+
+    def _load_cache_tensor(self, prefix, idx):
+        path = os.path.join(self.cache_dir, f"{prefix}_{idx:06d}.pt")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing cache file: {path}")
+        return torch.load(path, map_location="cpu")
+
+    def _validate_cache(self):
+        indices_by_prefix = {prefix: self._collect_indices(prefix) for prefix in self.CACHE_PREFIXES}
+        reference_indices = indices_by_prefix["prompt_embeds"]
+        for prefix, indices in indices_by_prefix.items():
+            if indices != reference_indices:
+                raise ValueError(
+                    f"Cache prefix '{prefix}' has indices that do not match prompt_embeds. "
+                    f"prompt_embeds={len(reference_indices)}, {prefix}={len(indices)}"
+                )
+
+        sample = {prefix: self._load_cache_tensor(prefix, 0) for prefix in self.CACHE_PREFIXES}
+
+        if sample["prompt_embeds"].ndim != 2 or not sample["prompt_embeds"].is_floating_point():
+            raise ValueError(
+                "prompt_embeds_000000.pt must be a floating point tensor with shape (sequence, hidden_dim); "
+                f"got shape={tuple(sample['prompt_embeds'].shape)}, dtype={sample['prompt_embeds'].dtype}"
+            )
+        if sample["text_ids"].ndim != 2 or sample["text_ids"].shape[-1] != 4 or sample["text_ids"].dtype != torch.long:
+            raise ValueError(
+                "text_ids_000000.pt must be an int64 tensor with shape (sequence, 4); "
+                f"got shape={tuple(sample['text_ids'].shape)}, dtype={sample['text_ids'].dtype}"
+            )
+        if sample["prompt_embeds"].shape[0] != sample["text_ids"].shape[0]:
+            raise ValueError(
+                "prompt_embeds and text_ids sequence lengths differ: "
+                f"{sample['prompt_embeds'].shape[0]} vs {sample['text_ids'].shape[0]}"
+            )
+
+        latent_shape = sample["latents"].shape
+        for prefix in self.LATENT_PREFIXES:
+            tensor = sample[prefix]
+            if tensor.ndim != 3 or not tensor.is_floating_point():
+                raise ValueError(
+                    f"{prefix}_000000.pt must be a floating point tensor with shape (channels, height, width); "
+                    f"got shape={tuple(tensor.shape)}, dtype={tensor.dtype}"
+                )
+            if tensor.shape != latent_shape:
+                raise ValueError(
+                    f"All latent cache tensors must have the same shape. "
+                    f"latents={tuple(latent_shape)}, {prefix}={tuple(tensor.shape)}"
+                )
+
+        return len(reference_indices)
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
         return {
-            "prompt_embeds": torch.load(os.path.join(self.cache_dir, f"prompt_embeds_{idx:06d}.pt")),
-            "text_ids": torch.load(os.path.join(self.cache_dir, f"text_ids_{idx:06d}.pt")),
-            "latents": torch.load(os.path.join(self.cache_dir, f"latents_{idx:06d}.pt")),
-            "cond1_latents": torch.load(os.path.join(self.cache_dir, f"cond1_latents_{idx:06d}.pt")),
-            "cond2_latents": torch.load(os.path.join(self.cache_dir, f"cond2_latents_{idx:06d}.pt")),
+            "prompt_embeds": self._load_cache_tensor("prompt_embeds", idx),
+            "text_ids": self._load_cache_tensor("text_ids", idx),
+            "latents": self._load_cache_tensor("latents", idx),
+            "cond1_latents": self._load_cache_tensor("cond1_latents", idx),
+            "cond2_latents": self._load_cache_tensor("cond2_latents", idx),
         }
 
 
@@ -218,6 +298,9 @@ def main(args):
         torch.manual_seed(args.seed)
         random.seed(args.seed)
 
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("--gradient_accumulation_steps must be >= 1")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Set weight dtype
@@ -226,6 +309,15 @@ def main(args):
         weight_dtype = torch.float16
     elif args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
+
+    # Validate the cache before loading heavy FLUX.2 components.
+    train_dataset = SimpleFluxDataset(args.cache_dir)
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        num_workers=0,
+    )
 
     # Load scheduler
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -308,17 +400,8 @@ def main(args):
     if args.mixed_precision == "fp16":
         cast_training_params([transformer], dtype=torch.float32)
 
-    # Load dataset
-    train_dataset = SimpleFluxDataset(args.cache_dir)
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        num_workers=0,
-    )
-
     # Calculate steps
-    num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
 
@@ -326,8 +409,8 @@ def main(args):
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=args.max_train_steps,
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
@@ -374,11 +457,11 @@ def main(args):
 
                 noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
-                # Prepare latent IDs
+                # Prepare latent IDs. Keep target ids separate because condition ids share H/W coordinates.
                 cond_ids = Flux2Pipeline._prepare_image_ids([cond1_latents[0], cond2_latents[0]]).to(device)
                 cond_ids = cond_ids.expand(bsz, -1, -1)
-                latent_ids = Flux2Pipeline._prepare_latent_ids(latents).to(device)
-                latent_ids = torch.cat([latent_ids, cond_ids], dim=1)
+                target_latent_ids = Flux2Pipeline._prepare_latent_ids(latents).to(device)
+                model_input_ids = torch.cat([target_latent_ids, cond_ids], dim=1)
 
                 # Pack conditions
                 packed_cond1 = Flux2Pipeline._pack_latents(cond1_latents)
@@ -386,8 +469,9 @@ def main(args):
                 packed_cond_latents = torch.cat([packed_cond1, packed_cond2], dim=1)
 
                 # Pack noisy latents and concatenate with conditions
-                packed_noisy_latents = Flux2Pipeline._pack_latents(noisy_latents)
-                packed_noisy_latents = torch.cat([packed_noisy_latents, packed_cond_latents], dim=1)
+                packed_noisy_target = Flux2Pipeline._pack_latents(noisy_latents)
+                target_seq_len = packed_noisy_target.size(1)
+                packed_model_input = torch.cat([packed_noisy_target, packed_cond_latents], dim=1)
 
                 # Guidance
                 guidance = torch.full([1], args.guidance_scale, device=device)
@@ -396,12 +480,12 @@ def main(args):
                 # Forward pass
                 # try:
                 model_pred = transformer(
-                    hidden_states=packed_noisy_latents,
+                    hidden_states=packed_model_input,
                     timestep=timesteps / 1000,
                     guidance=guidance,
                     encoder_hidden_states=prompt_embeds,
                     txt_ids=text_ids,
-                    img_ids=latent_ids,
+                    img_ids=model_input_ids,
                     return_dict=False,
                 )[0]
                 # except torch.OutOfMemoryError as e_oom:
@@ -414,18 +498,26 @@ def main(args):
                 #     torch.cuda.memory._record_memory_history(enabled=None)
                 
                 # Unpack prediction
-                model_pred = model_pred[:, :packed_noisy_latents.size(1)]
-                model_pred = Flux2Pipeline._unpack_latents_with_ids(model_pred, latent_ids)
+                model_pred = model_pred[:, :target_seq_len]
+                model_pred = Flux2Pipeline._unpack_latents_with_ids(model_pred, target_latent_ids)
 
                 # Flow matching loss
                 target = noise - latents
                 loss = nn.functional.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                batches_left = len(train_dataloader) - step
+                final_partial_steps = len(train_dataloader) % args.gradient_accumulation_steps
+                if final_partial_steps and batches_left <= final_partial_steps:
+                    accumulation_scale = final_partial_steps
+                else:
+                    accumulation_scale = args.gradient_accumulation_steps
+                scaled_loss = loss / accumulation_scale
 
                 # Backward pass
-                loss.backward()
+                scaled_loss.backward()
 
                 # Gradient clipping
-                if (step + 1) % args.gradient_accumulation_steps == 0:
+                should_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_dataloader)
+                if should_step:
                     torch.nn.utils.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
                     optimizer.step()
                     lr_scheduler.step()

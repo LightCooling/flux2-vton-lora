@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-diffusers = { git = "https://github.com/huggingface/diffusers" }
+diffusers = { git = "https://github.com/huggingface/diffusers", rev = "1b91856d0eee7b6fb58340e9b54ea2c3d5424311" }
 
 [tool.pyright]
 reportPrivateImportUsage = false

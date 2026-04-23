@@ -3,8 +3,8 @@
 # Training script for Flux.2 I2I caching
 
 import argparse
-import json
 import os
+import shutil
 
 import torch
 from PIL.ImageOps import exif_transpose
@@ -118,6 +118,11 @@ def parse_args(input_args=None):
         help="Output cache directory",
     )
     parser.add_argument(
+        "--overwrite_cache",
+        action="store_true",
+        help="Delete and recreate output_dir if it already contains files.",
+    )
+    parser.add_argument(
         "--resolution",
         type=int,
         default=512,
@@ -126,8 +131,8 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--max_sequence_length",
         type=int,
-        default=512,
-        help="Maximum sequence length to use with with the T5 text encoder",
+        default=128,
+        help="Maximum sequence length to use with the text encoder",
     )
 
     if input_args is not None:
@@ -157,6 +162,13 @@ def main(args):
         args.resolution,
     )
 
+    if os.path.isdir(args.output_dir) and os.listdir(args.output_dir):
+        if not args.overwrite_cache:
+            raise ValueError(
+                f"Output cache directory is not empty: {args.output_dir}. "
+                "Use --overwrite_cache to delete it before writing a new cache."
+            )
+        shutil.rmtree(args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Phase 1: Text embeddings

@@ -42,3 +42,6 @@ uv.lock
 # Visual Studio Code
 .vscode/
 
+# Coding agents
+.claude/
+.codex
